@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"log"
 	"net/http"
 )
@@ -10,46 +10,72 @@ type apiConfig struct {
 	fileserverHits int
 }
 
-func (cfg *apiConfig) middlewareMetricInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg.fileserverHits++
-		next.ServeHTTP(w, r)
+func chirpValidateHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Body string `json:"body"`
+	}
+	type returnVals struct {
+		Valid bool `json:"valid"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
+		return
+	}
+	maxChirpLength := 140
+	if len(params.Body) > maxChirpLength {
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, returnVals{
+		Valid: true,
 	})
 }
 
-func (cfg *apiConfig) hitsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Hits: %d", cfg.fileserverHits)
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+	if code > 499 {
+		log.Printf("Responding with 5XX error: %s", msg)
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+	}
+	respondWithJSON(w, code, errorResponse{
+		Error: msg,
+	})
 }
 
-func (cfg *apiConfig) resetHitsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	cfg.fileserverHits = 0
-	fmt.Fprintf(w, "reset hits to %d", cfg.fileserverHits)
-}
-
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	dat, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	w.WriteHeader(code)
+	w.Write(dat)
 }
 
 func main() {
 	const port = "8080"
+	apiCfg := apiConfig{
+		fileserverHits: 0,
+	}
+	const filepathRoot = "."
 
 	mux := http.NewServeMux()
 
-	fileServer := http.FileServer(http.Dir("."))
+	fsHandler := apiCfg.middlewareMetricInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot))))
 
-	var apiCfg apiConfig
+	mux.Handle("/app/*", fsHandler)
 
-	mux.Handle("/app/*", apiCfg.middlewareMetricInc(http.StripPrefix("/app", fileServer)))
-
-	mux.HandleFunc("GET /api/healthz", healthzHandler)
-	mux.HandleFunc("GET /api/metrics", apiCfg.hitsHandler)
+	mux.HandleFunc("GET /api/healthz", readinessHandler)
+	mux.HandleFunc("GET /admin/metrics", apiCfg.hitsHandler)
 	mux.HandleFunc("GET /api/reset", apiCfg.resetHitsHandler)
+	mux.HandleFunc("POST /api/validate_chirp", chirpValidateHandler)
 
 	server := &http.Server{
 		Addr:    ":" + port,
